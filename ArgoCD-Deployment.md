@@ -1,181 +1,260 @@
-# Grafana Setup and Integration with Prometheus on EKS
+## **1. What is GitOps? **
 
-This guide covers the complete setup of Grafana and its integration with Prometheus for Kubernetes monitoring on an AWS EKS cluster.
+GitOps is a modern way to manage Kubernetes deployments.
+
+**Key points:**
+
+* **Git = Source of Truth** → All Kubernetes manifests live in Git.
+* **Declarative** → You describe *what* you want (YAML), not *how* to do it.
+* **Pull-based** → A tool (like Argo CD) pulls from Git and updates the cluster.
+* **Continuous Reconciliation** → It keeps checking if the cluster matches Git, and fixes it if not.
+
+**Why GitOps?**
+
+* Every change is tracked in Git history.
+* Easy rollbacks.
+* Fewer manual mistakes.
+* Strong security (no direct cluster access for everyone).
 
 ---
 
-## 1. Introduction
+## **2. What is Argo CD? **
 
-Grafana is an open-source analytics and monitoring solution used to visualize time-series data. In this setup, Grafana is used to display Prometheus metrics for your Kubernetes cluster running on Amazon EKS.
+**Definition:**
+Argo CD is a **GitOps operator** for Kubernetes that:
+
+* Continuously monitors a Git repo.
+* Deploys changes automatically or manually.
+* Shows visual status in a Web UI.
+* Can manage multiple clusters.
+
+**Argo CD Components:**
+
+1. **argocd-server** → Web UI + API.
+2. **application-controller** → Syncs Git with cluster.
+3. **repo-server** → Fetches Git repo, processes Helm/Kustomize.
+4. **Redis** → Cache for performance.
 
 ---
 
-## 2. Prerequisites
+## **3. How Argo CD Works **
 
-* A running EKS cluster
-* Prometheus already installed (via Helm)
-* `kubectl` access to the cluster
-* Helm 3 installed on your local system
+1. You define your Kubernetes YAML in Git.
+2. Argo CD pulls those files.
+3. It compares **Git (desired state)** vs **Cluster (live state)**.
+4. If different → you sync manually or auto-sync.
+5. If auto-sync + self-heal → it updates automatically.
 
 ---
 
-## 3. Add Grafana Helm Repository
+## **4. Setting up Argo CD on our AWS Kubernetes Cluster **
+
+### **Step 1 – Install Argo CD**
+
+We install Argo CD in its own namespace:
 
 ```bash
-helm repo add grafana https://grafana.github.io/helm-charts
-helm repo update
+kubectl create namespace argocd
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+```
+
+Check if all pods are running:
+
+```bash
+kubectl get pods -n argocd
 ```
 
 ---
 
-## 4. Install Grafana Using Helm
+### **Step 2 – Access Argo CD UI**
+
+Since we’re using a self-managed kubeadm cluster, we’ll use **NodePort**:
 
 ```bash
-helm upgrade --install grafana grafana/grafana \
-  --namespace monitoring \
-  --create-namespace
+kubectl -n argocd patch svc argocd-server \
+  -p '{"spec":{"type":"NodePort","ports":[{"name":"https","port":443,"targetPort":8080,"nodePort":30080}]}}'
+
+
+# Switch the existing service to an internet-facing ELB
+kubectl patch svc argocd-server -n argocd -p '{"spec":{"type":"LoadBalancer"}}'
+
+# (Optional but recommended) ensure it listens on 80/443 cleanly
+kubectl patch svc argocd-server -n argocd --type='json' -p='[
+  {"op":"replace","path":"/spec/ports/0/port","value":80},
+  {"op":"replace","path":"/spec/ports/1/port","value":443}
+]'
+
 ```
 
----
-
-## 5. Access Grafana Dashboard
-
-Check the external LoadBalancer URL:
+Get Node Public IP:
 
 ```bash
-kubectl get svc -n monitoring grafana
+kubectl get nodes -o wide
 ```
-
-Example output:
-
-```
-grafana   LoadBalancer   <EXTERNAL-IP>   80:32060/TCP   5m
-```
-
-Login credentials:
-
-```bash
-kubectl get secret --namespace monitoring grafana \
-  -o jsonpath="{.data.admin-password}" | base64 --decode ; echo
-```
-
-* **Username:** `admin`
-* **Password:** <output of above command>
 
 Open browser:
 
 ```
-http://<EXTERNAL-IP>
+https://<NODE_PUBLIC_IP>:30080
 ```
 
----
-
-## 6. Add Prometheus as Data Source in Grafana
-
-1. Go to **Gear Icon (Settings)** → **Data Sources**
-2. Click **Add data source** → Choose **Prometheus**
-3. Fill details:
-
-   * **Name:** Prometheus
-   * **URL:** `http://prometheus-server.monitoring.svc.cluster.local`
-4. Click **Save & Test**
+**Note:** Accept security warning (self-signed certificate).
 
 ---
 
-## 7. Import Kubernetes Monitoring Dashboards
+### **Step 3 – Login to Argo CD**
 
-1. Go to **+ Create** → **Import**
-2. Use any of the following Dashboard IDs:
-
-   * `315` – Node Exporter Full
-   * `6417` – K8s cluster monitoring
-3. Select Prometheus as the data source → Click **Import**
-
----
-
-## 8. Validate Prometheus Targets
-
-Visit Prometheus UI:
+Get the admin password:
 
 ```bash
-kubectl port-forward -n monitoring svc/prometheus-server 9090
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d; echo
 ```
 
-In browser: `http://localhost:9090`
-
-* Go to **Status** → **Targets**
-* Ensure all targets are UP (Node Exporter, Kube State Metrics, etc.)
+* Username: `admin`
+* Password: (from above)
 
 ---
 
-## 9. Useful Prometheus Queries
+## **5. Deploying a Sample App with Argo CD **
 
-### Pods in Pending State:
+We will deploy the **Guestbook app**.
 
-```promql
-count(kube_pod_status_phase{phase="Pending"})
-```
+---
 
-### Total Number of Nodes:
+### **Step 1 – Prepare Namespace**
 
-```promql
-count(kube_node_info)
-```
-
-### CPU Usage by Node:
-
-```promql
-rate(container_cpu_usage_seconds_total{image!=""}[5m])
-```
-
-### Memory Usage:
-
-```promql
-(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100
+```bash
+kubectl create namespace dev
 ```
 
 ---
 
-## 10. Email Alert Integration Example
+### **Step 2 – Fork the Sample Repo**
 
-In `values.yaml` (Alertmanager config):
+* Go to: [https://github.com/argoproj/argocd-example-apps](https://github.com/argoproj/argocd-example-apps)
+* Click **Fork** into your GitHub account.
+
+---
+
+### **Step 3 – Create App in Argo CD UI**
+
+* Click **NEW APP**.
+* Fill in:
+
+  * **Application Name**: `guestbook-dev`
+  * **Project**: `default`
+  * **Sync Policy**: Manual (first time)
+  * **Repository URL**: (Your fork HTTPS URL)
+  * **Revision**: `main`
+  * **Path**: `guestbook`
+  * **Cluster URL**: `https://kubernetes.default.svc`
+  * **Namespace**: `dev`
+
+Click **CREATE**.
+
+---
+
+### **Step 4 – Sync the App**
+
+* Open the new app.
+* Click **SYNC** → **Synchronize**.
+* Argo CD will create Kubernetes resources.
+
+---
+
+### **Step 5 – Verify in Cluster**
+
+```bash
+kubectl get pods -n dev
+kubectl get svc -n dev
+```
+
+You should see the guestbook pods running.
+
+---
+
+## **6. Auto-Sync & Self-Heal Demo **
+
+**Step 1 – Enable Auto-Sync**
+
+* In the app → **App Details** → **Actions** → **Enable Auto-Sync**.
+* Check **Prune** and **Self-Heal**.
+
+---
+
+**Step 2 – Change in Git → Auto Deployment**
+
+* In your fork, edit `guestbook-ui-deployment.yaml`:
 
 ```yaml
-alertmanager:
-  config:
-    global:
-      resolve_timeout: 1m
-    receivers:
-      - name: 'gmail-notifications'
-        email_configs:
-          - to: g.prasanth532@gmail.com
-            from: kkeducationblr@gmail.com
-            smarthost: smtp.gmail.com:587
-            auth_username: kkeducationblr@gmail.com
-            auth_identity: kkeducationblr@gmail.com
-            auth_password: <app-password>
-            send_resolved: true
-    route:
-      receiver: 'gmail-notifications'
-      group_wait: 10s
-      group_interval: 2m
-      repeat_interval: 2m
+replicas: 1
 ```
 
-**Note:** Enable 2-step verification in Gmail and generate an App Password to use for `auth_password`.
+change to:
+
+```yaml
+replicas: 3
+```
+
+* Commit and push.
+* Argo CD will detect the change and deploy automatically.
 
 ---
 
-## 11. Troubleshooting Tips
+**Step 3 – Self-Heal**
+Manually scale in cluster:
 
-* If Grafana panels show `N/A`, check Prometheus targets.
-* Confirm network policies and security groups allow communication.
-* Verify Prometheus URL is reachable from Grafana pod.
+```bash
+kubectl scale deploy guestbook-ui -n dev --replicas=5
+```
+
+* Wait \~1 min → Argo CD will revert it back to **3**.
 
 ---
 
-## 12. Conclusion
+## **7. Wrap-Up **
 
-With this setup, your EKS cluster is now integrated with Prometheus and Grafana for full visibility into your cluster performance, pod states, node metrics, and real-time alerting.
+**Summary for Students:**
 
-For further custom dashboards, alerts, or queries, reach out to your DevOps team or refer to the [Grafana Labs documentation](https://grafana.com/docs/).
+* Argo CD is a **GitOps tool** for Kubernetes.
+* Everything comes from **Git**.
+* You can deploy **manually** or **automatically**.
+* **Self-Heal** enforces Git state on the cluster.
+* NodePort is easiest for accessing Argo CD in self-managed clusters.
+
+---
+
+## **8. Commands Recap**
+
+```bash
+# Install Argo CD
+kubectl create ns argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Access via NodePort
+kubectl -n argocd patch svc argocd-server -p '{"spec":{"type":"NodePort","ports":[{"name":"https","port":443,"targetPort":8080,"nodePort":30080}]}}'
+kubectl get nodes -o wide  # get public IP
+
+# Get password
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d; echo
+
+# Create namespace for app
+kubectl create ns dev
+
+# Verify resources
+kubectl get pods -n dev
+kubectl get svc -n dev
+```
+
+---
+
+## **9. Homework for Students**
+
+* Try deploying another app from the same repo.
+* Enable auto-sync + self-heal for it.
+* Change replicas in Git and watch Argo CD update.
+* Delete a pod manually → see self-heal recreate it.
+
+---
